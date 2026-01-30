@@ -7,6 +7,7 @@ import io.ktor.http.parseQueryString
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.schabi.newpipe.extractor.NewPipe as OfficialNewPipe
+import org.schabi.newpipe.extractor.downloader.CancellableCall
 import org.schabi.newpipe.extractor.downloader.Downloader
 import org.schabi.newpipe.extractor.downloader.Request
 import org.schabi.newpipe.extractor.downloader.Response
@@ -65,7 +66,11 @@ private class NewPipeExtractorDownloaderImpl(proxy: Proxy?, proxyAuth: String?) 
 
         val responseBodyToReturn = response.body.string()
         val latestUrl = response.request.url.toString()
-        return Response(response.code, response.message, response.headers.toMultimap(), responseBodyToReturn, latestUrl)
+        return Response(response.code, response.message, response.headers.toMultimap(), responseBodyToReturn, responseBodyToReturn.toByteArray(), latestUrl)
+    }
+
+    override fun executeAsync(request: Request, callback: AsyncCallback?): CancellableCall {
+        TODO("Async execution not implemented")
     }
 }
 
@@ -80,19 +85,8 @@ private class NewPipeExtractorDownloaderImpl(proxy: Proxy?, proxyAuth: String?) 
  */
 object NewPipeExtractorUtils {
 
-    @Volatile
-    private var isInitialized = false
-    private val initLock = Any()
-
-    private fun ensureInitialized() {
-        if (!isInitialized) {
-            synchronized(initLock) {
-                if (!isInitialized) {
-                    OfficialNewPipe.init(NewPipeExtractorDownloaderImpl(YouTube.proxy, YouTube.proxyAuth))
-                    isInitialized = true
-                }
-            }
-        }
+    init {
+        OfficialNewPipe.init(NewPipeExtractorDownloaderImpl(YouTube.proxy, YouTube.proxyAuth))
     }
 
     /**
@@ -102,7 +96,6 @@ object NewPipeExtractorUtils {
      * @return Result containing the signature timestamp or an error
      */
     fun getSignatureTimestamp(videoId: String): Result<Int> = runCatching {
-        ensureInitialized()
         OfficialYoutubeJSPlayerManager.getSignatureTimestamp(videoId)
     }
 
@@ -116,8 +109,6 @@ object NewPipeExtractorUtils {
      */
     fun getStreamUrl(format: PlayerResponse.StreamingData.Format, videoId: String): Result<String> =
         runCatching {
-            ensureInitialized()
-            
             val url = format.url ?: format.signatureCipher?.let { signatureCipher ->
                 val params = parseQueryString(signatureCipher)
                 val obfuscatedSignature = params["s"]
@@ -140,13 +131,9 @@ object NewPipeExtractorUtils {
             )
         }
     
-    /**
-     * Clears cached player data to force refresh on next use.
-     * Call this when decryption errors occur to get fresh player data.
-     */
     fun clearCache() {
-        synchronized(initLock) {
-            isInitialized = false
+        runCatching {
+            OfficialYoutubeJSPlayerManager.clearCache()
         }
     }
 }
