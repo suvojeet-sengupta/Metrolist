@@ -7,7 +7,6 @@ import io.ktor.http.parseQueryString
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.schabi.newpipe.extractor.NewPipe as OfficialNewPipe
-import org.schabi.newpipe.extractor.downloader.CancellableCall
 import org.schabi.newpipe.extractor.downloader.Downloader
 import org.schabi.newpipe.extractor.downloader.Request
 import org.schabi.newpipe.extractor.downloader.Response
@@ -66,11 +65,7 @@ private class NewPipeExtractorDownloaderImpl(proxy: Proxy?, proxyAuth: String?) 
 
         val responseBodyToReturn = response.body.string()
         val latestUrl = response.request.url.toString()
-        return Response(response.code, response.message, response.headers.toMultimap(), responseBodyToReturn, responseBodyToReturn.toByteArray(), latestUrl)
-    }
-
-    override fun executeAsync(request: Request, callback: AsyncCallback?): CancellableCall {
-        TODO("Async execution not implemented")
+        return Response(response.code, response.message, response.headers.toMultimap(), responseBodyToReturn, latestUrl)
     }
 }
 
@@ -131,9 +126,15 @@ object NewPipeExtractorUtils {
             )
         }
     
+    /**
+     * Clears cached player data to force refresh on next use.
+     * Call this when decryption errors occur to get fresh player data.
+     */
     fun clearCache() {
         runCatching {
-            OfficialYoutubeJSPlayerManager.clearCache()
+            val clearMethod = OfficialYoutubeJSPlayerManager::class.java.getDeclaredMethod("clearCache")
+            clearMethod.isAccessible = true
+            clearMethod.invoke(null)
         }
     }
 }
