@@ -2139,11 +2139,17 @@ class MusicService :
                 return@Factory dataSpec.withUri(it.first.toUri())
             }
 
+            // Check if this is an uploaded song (requires authentication to play)
+            val isUploaded = runBlocking(Dispatchers.IO) {
+                database.song(mediaId).first()?.song?.isUploaded == true
+            }
+
             val playbackData = runBlocking(Dispatchers.IO) {
                 YTPlayerUtils.playerResponseForPlayback(
                     mediaId,
                     audioQuality = audioQuality,
                     connectivityManager = connectivityManager,
+                    isUploaded = isUploaded,
                 )
             }.getOrElse { throwable ->
                 when (throwable) {
@@ -2488,10 +2494,12 @@ class MusicService :
     suspend fun getStreamUrl(mediaId: String): String? {
         return withContext(Dispatchers.IO) {
             try {
+                val isUploaded = database.song(mediaId).first()?.song?.isUploaded == true
                 val playbackData = YTPlayerUtils.playerResponseForPlayback(
                     videoId = mediaId,
                     audioQuality = audioQuality,
                     connectivityManager = connectivityManager,
+                    isUploaded = isUploaded,
                 ).getOrNull()
                 playbackData?.streamUrl
             } catch (e: Exception) {

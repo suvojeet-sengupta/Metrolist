@@ -40,6 +40,12 @@ object YTPlayerUtils {
     private val MAIN_CLIENT = ANDROID_VR_NO_AUTH
 
     /**
+     * Main client for uploaded songs - TVHTML5 supports authentication required for uploaded content.
+     * Uploaded songs require TV client with login to play properly.
+     */
+    private val UPLOADED_SONGS_CLIENT = TVHTML5
+
+    /**
      * Fallback clients ordered by reliability.
      */
     private val FALLBACK_CLIENTS = arrayOf(
@@ -57,6 +63,19 @@ object YTPlayerUtils {
         WEB_CREATOR
     )
 
+    /**
+     * Fallback clients for uploaded songs - prioritize TV clients that support authentication.
+     * Uploaded songs are private and require login to access.
+     */
+    private val UPLOADED_SONGS_FALLBACK_CLIENTS = arrayOf(
+        TVHTML5,
+        TVHTML5_SIMPLY_EMBEDDED_PLAYER,
+        WEB_REMIX,
+        WEB_CREATOR,
+        ANDROID_CREATOR,
+        MOBILE
+    )
+
     data class PlaybackData(
         val audioConfig: PlayerResponse.PlayerConfig.AudioConfig?,
         val videoDetails: PlayerResponse.VideoDetails?,
@@ -70,33 +89,48 @@ object YTPlayerUtils {
      * Custom player response intended to use for playback.
      * Metadata like audioConfig and videoDetails are from the main client.
      * Format & stream can be from main client or fallback clients.
+     * 
+     * @param isUploaded If true, uses TVHTML5 client with authentication for uploaded songs
+     *                   which require login to play. Uploaded songs are private content
+     *                   that can only be accessed with TV client authentication.
      */
     suspend fun playerResponseForPlayback(
         videoId: String,
         playlistId: String? = null,
         audioQuality: AudioQuality,
         connectivityManager: ConnectivityManager,
+        isUploaded: Boolean = false,
     ): Result<PlaybackData> = runCatching {
-        Timber.tag(logTag).d("Fetching player response for videoId: $videoId, playlistId: $playlistId, client: ${MAIN_CLIENT.clientName}")
+        val isLoggedIn = YouTube.cookie != null
+        
+        // For uploaded songs, we need to use TVHTML5 with authentication
+        val mainClient = if (isUploaded && isLoggedIn) UPLOADED_SONGS_CLIENT else MAIN_CLIENT
+        val fallbackClients = if (isUploaded && isLoggedIn) UPLOADED_SONGS_FALLBACK_CLIENTS else FALLBACK_CLIENTS
+        
+        Timber.tag(logTag).d("Fetching player response for videoId: $videoId, playlistId: $playlistId, isUploaded: $isUploaded, client: ${mainClient.clientName}")
 
         val signatureTimestamp = getSignatureTimestampOrNull(videoId)
         Timber.tag(logTag).d("Signature timestamp: $signatureTimestamp")
 
-        val isLoggedIn = YouTube.cookie != null
         Timber.tag(logTag).d("Session authentication status: ${if (isLoggedIn) "Logged in" else "Not logged in"}")
 
-        Timber.tag(logTag).d("Attempting to get player response using main client: ${MAIN_CLIENT.clientName}")
+        Timber.tag(logTag).d("Attempting to get player response using main client: ${mainClient.clientName}")
         val mainPlayerResponse =
-            YouTube.player(videoId, playlistId, MAIN_CLIENT, signatureTimestamp).getOrThrow()
+            YouTube.player(videoId, playlistId, mainClient, signatureTimestamp).getOrThrow()
         val audioConfig = mainPlayerResponse.playerConfig?.audioConfig
         val videoDetails = mainPlayerResponse.videoDetails
 
         // Always use WEB_REMIX for playbackTracking to ensure history sync works
         // ANDROID_VR clients don't support login and may not return valid playbackTracking
         val playbackTracking = run {
-            Timber.tag(logTag).d("Fetching playbackTracking from WEB_REMIX for history sync")
-            YouTube.player(videoId, playlistId, WEB_REMIX, signatureTimestamp)
-                .getOrNull()?.playbackTracking ?: mainPlayerResponse.playbackTracking
+            if (mainClient == WEB_REMIX) {
+                // Already using WEB_REMIX, reuse the response
+                mainPlayerResponse.playbackTracking
+            } else {
+                Timber.tag(logTag).d("Fetching playbackTracking from WEB_REMIX for history sync")
+                YouTube.player(videoId, playlistId, WEB_REMIX, signatureTimestamp)
+                    .getOrNull()?.playbackTracking ?: mainPlayerResponse.playbackTracking
+            }
         }
 
         var format: PlayerResponse.StreamingData.Format? = null
@@ -104,19 +138,19 @@ object YTPlayerUtils {
         var streamExpiresInSeconds: Int? = null
         var streamPlayerResponse: PlayerResponse? = null
 
-        for (clientIndex in (-1 until FALLBACK_CLIENTS.size)) {
+        for (clientIndex in (-1 until fallbackClients.size)) {
             format = null
             streamUrl = null
             streamExpiresInSeconds = null
 
             val client: YouTubeClient
             if (clientIndex == -1) {
-                client = MAIN_CLIENT
+                client = mainClient
                 streamPlayerResponse = mainPlayerResponse
                 Timber.tag(logTag).d("Trying stream from main client: ${client.clientName}")
             } else {
-                client = FALLBACK_CLIENTS[clientIndex]
-                Timber.tag(logTag).d("Trying fallback client ${clientIndex + 1}/${FALLBACK_CLIENTS.size}: ${client.clientName}")
+                client = fallbackClients[clientIndex]
+                Timber.tag(logTag).d("Trying fallback client ${clientIndex + 1}/${fallbackClients.size}: ${client.clientName}")
 
                 if (client.loginRequired && !isLoggedIn && YouTube.cookie == null) {
                     Timber.tag(logTag).d("Skipping client ${client.clientName} - requires login but user is not logged in")
@@ -160,7 +194,7 @@ object YTPlayerUtils {
                     break
                 }
 
-                if (clientIndex == FALLBACK_CLIENTS.size - 1) {
+                if (clientIndex == fallbackClients.size - 1) {
                     Timber.tag(logTag).d("Using last fallback client without validation: ${client.clientName}")
                     break
                 }

@@ -85,11 +85,17 @@ constructor(
                 return@Factory dataSpec.withUri(it.first.toUri())
             }
 
+            // Check if this is an uploaded song (requires authentication to play)
+            val isUploaded = runBlocking(Dispatchers.IO) {
+                database.song(mediaId).first()?.song?.isUploaded == true
+            }
+
             val playbackData = runBlocking(Dispatchers.IO) {
                 YTPlayerUtils.playerResponseForPlayback(
                     mediaId,
                     audioQuality = audioQuality,
                     connectivityManager = connectivityManager,
+                    isUploaded = isUploaded,
                 )
             }.getOrThrow()
             val format = playbackData.format
