@@ -67,6 +67,50 @@ object YTPlayerUtils {
     )
 
     /**
+     * Playability status constants for better handling of different video states
+     */
+    private object PlayabilityStatus {
+        const val OK = "OK"
+        const val UNPLAYABLE = "UNPLAYABLE"
+        const val ERROR = "ERROR"
+        const val LOGIN_REQUIRED = "LOGIN_REQUIRED"
+        const val AGE_CHECK_REQUIRED = "AGE_CHECK_REQUIRED"
+        const val AGE_VERIFICATION_REQUIRED = "AGE_VERIFICATION_REQUIRED"
+        const val CONTENT_CHECK_REQUIRED = "CONTENT_CHECK_REQUIRED"
+        const val LIVE_STREAM_OFFLINE = "LIVE_STREAM_OFFLINE"
+    }
+
+    /**
+     * Check if the playability status indicates content that might be playable with fallback clients
+     */
+    private fun isPlayableOrRetryable(status: String?): Boolean {
+        return when (status) {
+            PlayabilityStatus.OK -> true
+            // These statuses might work with different clients
+            PlayabilityStatus.UNPLAYABLE,
+            PlayabilityStatus.LOGIN_REQUIRED,
+            PlayabilityStatus.AGE_CHECK_REQUIRED,
+            PlayabilityStatus.AGE_VERIFICATION_REQUIRED,
+            PlayabilityStatus.CONTENT_CHECK_REQUIRED -> true
+            else -> false
+        }
+    }
+
+    /**
+     * Check if we should try NewPipe extraction for this status
+     */
+    private fun shouldTryNewPipeExtraction(status: String?): Boolean {
+        return when (status) {
+            PlayabilityStatus.UNPLAYABLE,
+            PlayabilityStatus.LOGIN_REQUIRED,
+            PlayabilityStatus.AGE_CHECK_REQUIRED,
+            PlayabilityStatus.AGE_VERIFICATION_REQUIRED,
+            PlayabilityStatus.CONTENT_CHECK_REQUIRED -> true
+            else -> false
+        }
+    }
+
+    /**
      * Custom player response intended to use for playback.
      * Metadata like audioConfig and videoDetails are from the main client.
      * Format & stream can be from main client or fallback clients.
@@ -86,23 +130,34 @@ object YTPlayerUtils {
         Timber.tag(logTag).d("Session authentication status: ${if (isLoggedIn) "Logged in" else "Not logged in"}")
 
         Timber.tag(logTag).d("Attempting to get player response using main client: ${MAIN_CLIENT.clientName}")
+        
+        // Use getOrNull() instead of getOrThrow() to allow fallback clients to be tried
         val mainPlayerResponse =
-            YouTube.player(videoId, playlistId, MAIN_CLIENT, signatureTimestamp).getOrThrow()
-        val audioConfig = mainPlayerResponse.playerConfig?.audioConfig
-        val videoDetails = mainPlayerResponse.videoDetails
+            YouTube.player(videoId, playlistId, MAIN_CLIENT, signatureTimestamp).getOrNull()
+        
+        // Try to get audioConfig and videoDetails from main client or fallback to WEB_REMIX
+        val (audioConfig, videoDetails) = if (mainPlayerResponse?.playabilityStatus?.status == PlayabilityStatus.OK) {
+            mainPlayerResponse.playerConfig?.audioConfig to mainPlayerResponse.videoDetails
+        } else {
+            Timber.tag(logTag).d("Main client failed or not OK, trying WEB_REMIX for metadata")
+            val webRemixResponse = YouTube.player(videoId, playlistId, WEB_REMIX, signatureTimestamp).getOrNull()
+            webRemixResponse?.playerConfig?.audioConfig to webRemixResponse?.videoDetails
+        }
 
         // Always use WEB_REMIX for playbackTracking to ensure history sync works
         // ANDROID_VR clients don't support login and may not return valid playbackTracking
         val playbackTracking = run {
             Timber.tag(logTag).d("Fetching playbackTracking from WEB_REMIX for history sync")
             YouTube.player(videoId, playlistId, WEB_REMIX, signatureTimestamp)
-                .getOrNull()?.playbackTracking ?: mainPlayerResponse.playbackTracking
+                .getOrNull()?.playbackTracking ?: mainPlayerResponse?.playbackTracking
         }
 
         var format: PlayerResponse.StreamingData.Format? = null
         var streamUrl: String? = null
         var streamExpiresInSeconds: Int? = null
         var streamPlayerResponse: PlayerResponse? = null
+        var lastStatus: String? = null
+        var lastReason: String? = null
 
         for (clientIndex in (-1 until FALLBACK_CLIENTS.size)) {
             format = null
@@ -128,10 +183,16 @@ object YTPlayerUtils {
                     YouTube.player(videoId, playlistId, client, signatureTimestamp).getOrNull()
             }
 
-            if (streamPlayerResponse?.playabilityStatus?.status == "OK") {
+            val currentStatus = streamPlayerResponse?.playabilityStatus?.status
+            val currentReason = streamPlayerResponse?.playabilityStatus?.reason
+            lastStatus = currentStatus
+            lastReason = currentReason
+
+            // Check if playable or might be playable with different approach
+            if (currentStatus == PlayabilityStatus.OK) {
                 Timber.tag(logTag).d("Player response status OK for client: ${client.clientName}")
 
-                format = findFormat(streamPlayerResponse, audioQuality, connectivityManager)
+                format = findFormat(streamPlayerResponse!!, audioQuality, connectivityManager)
 
                 if (format == null) {
                     Timber.tag(logTag).d("No suitable format found for client: ${client.clientName}")
@@ -172,18 +233,51 @@ object YTPlayerUtils {
                     Timber.tag(logTag).d("Stream validation failed for client: ${client.clientName}")
                 }
             } else {
-                Timber.tag(logTag).d("Player response status not OK: ${streamPlayerResponse?.playabilityStatus?.status}, reason: ${streamPlayerResponse?.playabilityStatus?.reason}")
+                Timber.tag(logTag).d("Player response status not OK: $currentStatus, reason: $currentReason")
+                
+                // For age-restricted or uploaded content, try NewPipe extraction immediately
+                if (shouldTryNewPipeExtraction(currentStatus) && streamPlayerResponse != null) {
+                    Timber.tag(logTag).d("Attempting NewPipe extraction for restricted content (status: $currentStatus)")
+                    
+                    val newPipeResult = tryNewPipeExtraction(videoId, streamPlayerResponse, audioQuality, connectivityManager)
+                    if (newPipeResult != null) {
+                        format = newPipeResult.first
+                        streamUrl = newPipeResult.second
+                        streamExpiresInSeconds = 21600 // 6 hours default for NewPipe streams
+                        Timber.tag(logTag).d("NewPipe extraction successful for client: ${client.clientName}")
+                        break
+                    }
+                }
             }
         }
 
-        if (streamPlayerResponse == null) {
+        // If all regular clients failed, try full NewPipe extraction as last resort
+        if (streamUrl == null && format == null) {
+            Timber.tag(logTag).d("All clients failed, attempting full NewPipe extraction as last resort")
+            val lastResponse = streamPlayerResponse ?: mainPlayerResponse
+            if (lastResponse != null) {
+                val newPipeResult = tryNewPipeExtraction(videoId, lastResponse, audioQuality, connectivityManager)
+                if (newPipeResult != null) {
+                    format = newPipeResult.first
+                    streamUrl = newPipeResult.second
+                    streamExpiresInSeconds = 21600 // 6 hours default
+                    streamPlayerResponse = lastResponse
+                }
+            }
+        }
+
+        if (streamPlayerResponse == null && mainPlayerResponse == null) {
             Timber.tag(logTag).e("Bad stream player response - all clients failed")
             throw Exception("Bad stream player response")
         }
 
-        if (streamPlayerResponse.playabilityStatus.status != "OK") {
-            val errorReason = streamPlayerResponse.playabilityStatus.reason
-            Timber.tag(logTag).e("Playability status not OK: $errorReason")
+        // Use last known response for error message
+        val finalResponse = streamPlayerResponse ?: mainPlayerResponse!!
+
+        if (streamUrl == null || format == null) {
+            val errorReason = lastReason ?: finalResponse.playabilityStatus.reason ?: "Unknown error"
+            val errorStatus = lastStatus ?: finalResponse.playabilityStatus.status
+            Timber.tag(logTag).e("Playability status not OK: $errorStatus - $errorReason")
             throw PlaybackException(
                 errorReason,
                 null,
@@ -196,16 +290,6 @@ object YTPlayerUtils {
             throw Exception("Missing stream expire time")
         }
 
-        if (format == null) {
-            Timber.tag(logTag).e("Could not find format")
-            throw Exception("Could not find format")
-        }
-
-        if (streamUrl == null) {
-            Timber.tag(logTag).e("Could not find stream url")
-            throw Exception("Could not find stream url")
-        }
-
         Timber.tag(logTag).d("Successfully obtained playback data with format: ${format.mimeType}, bitrate: ${format.bitrate}")
         PlaybackData(
             audioConfig,
@@ -215,6 +299,77 @@ object YTPlayerUtils {
             streamUrl,
             streamExpiresInSeconds,
         )
+    }
+
+    /**
+     * Try to extract streams using NewPipe for age-restricted or uploaded content
+     */
+    private fun tryNewPipeExtraction(
+        videoId: String,
+        playerResponse: PlayerResponse,
+        audioQuality: AudioQuality,
+        connectivityManager: ConnectivityManager
+    ): Pair<PlayerResponse.StreamingData.Format, String>? {
+        return try {
+            Timber.tag(logTag).d("Attempting NewPipe full extraction for videoId: $videoId")
+            
+            val streamsResult = NewPipeUtils.getStreamsFromNewPipe(videoId)
+            if (streamsResult.isFailure) {
+                Timber.tag(logTag).w("NewPipe extraction failed: ${streamsResult.exceptionOrNull()?.message}")
+                return null
+            }
+            
+            val streams = streamsResult.getOrNull() ?: return null
+            if (streams.isEmpty()) {
+                Timber.tag(logTag).w("NewPipe returned no streams")
+                return null
+            }
+            
+            Timber.tag(logTag).d("NewPipe found ${streams.size} streams")
+            
+            // Try to find matching format from player response
+            val format = findFormat(playerResponse, audioQuality, connectivityManager)
+            if (format != null && streams.containsKey(format.itag)) {
+                val url = streams[format.itag]!!
+                Timber.tag(logTag).d("Found matching stream for itag ${format.itag}")
+                return format to url
+            }
+            
+            // If no matching format, try to get best audio from NewPipe
+            val bestAudioResult = NewPipeUtils.getBestAudioStreamUrl(videoId)
+            if (bestAudioResult.isSuccess) {
+                val url = bestAudioResult.getOrNull()
+                if (url != null) {
+                    // Find any audio format to use as template
+                    val audioFormat = playerResponse.streamingData?.adaptiveFormats
+                        ?.filter { it.isAudio }
+                        ?.firstOrNull()
+                    
+                    if (audioFormat != null) {
+                        Timber.tag(logTag).d("Using best audio stream from NewPipe")
+                        return audioFormat to url
+                    }
+                }
+            }
+            
+            // Last resort: use first available stream
+            val firstStream = streams.entries.firstOrNull()
+            if (firstStream != null) {
+                val audioFormat = playerResponse.streamingData?.adaptiveFormats
+                    ?.filter { it.isAudio }
+                    ?.firstOrNull()
+                if (audioFormat != null) {
+                    Timber.tag(logTag).d("Using first available stream from NewPipe as fallback")
+                    return audioFormat to firstStream.value
+                }
+            }
+            
+            null
+        } catch (e: Exception) {
+            Timber.tag(logTag).e(e, "NewPipe extraction failed with exception")
+            reportException(e)
+            null
+        }
     }
 
     /**
