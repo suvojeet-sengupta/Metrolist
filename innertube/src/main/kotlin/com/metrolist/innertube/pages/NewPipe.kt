@@ -10,10 +10,13 @@ import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.downloader.Downloader
 import org.schabi.newpipe.extractor.downloader.Request
 import org.schabi.newpipe.extractor.downloader.Response
+import org.schabi.newpipe.extractor.exceptions.AgeRestrictedContentException
+import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException
 import org.schabi.newpipe.extractor.exceptions.ParsingException
 import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
 import org.schabi.newpipe.extractor.services.youtube.YoutubeJavaScriptPlayerManager
 import org.schabi.newpipe.extractor.stream.StreamInfo
+import timber.log.Timber
 import java.io.IOException
 import java.net.Proxy
 
@@ -50,19 +53,21 @@ private class NewPipeDownloaderImpl(proxy: Proxy?) : Downloader() {
 
         if (response.code == 429) {
             response.close()
-
             throw ReCaptchaException("reCaptcha Challenge requested", url)
         }
 
         val responseBodyToReturn = response.body?.string()
-
         val latestUrl = response.request.url.toString()
         return Response(response.code, response.message, response.headers.toMultimap(), responseBodyToReturn, latestUrl)
     }
-
 }
 
 object NewPipeUtils {
+    private const val TAG = "NewPipeUtils"
+
+    private val httpClient = OkHttpClient.Builder()
+        .proxy(YouTube.proxy)
+        .build()
 
     init {
         NewPipe.init(NewPipeDownloaderImpl(YouTube.proxy))
@@ -102,11 +107,13 @@ object NewPipeUtils {
      * Returns a map of itag to stream URL.
      */
     fun getStreamsFromNewPipe(videoId: String): Result<Map<Int, String>> = runCatching {
+        Timber.tag(TAG).d("Getting streams from NewPipe for videoId: $videoId")
         val streamInfo = StreamInfo.getInfo(
             NewPipe.getService(0),
             "https://www.youtube.com/watch?v=$videoId"
         )
         val streams = streamInfo.audioStreams + streamInfo.videoStreams + streamInfo.videoOnlyStreams
+        Timber.tag(TAG).d("NewPipe found ${streams.size} streams")
         streams.mapNotNull { stream ->
             val itag = stream.itagItem?.id ?: return@mapNotNull null
             val url = stream.content
@@ -119,6 +126,7 @@ object NewPipeUtils {
      * Returns the URL of the highest quality audio stream.
      */
     fun getBestAudioStreamUrl(videoId: String): Result<String> = runCatching {
+        Timber.tag(TAG).d("Getting best audio stream from NewPipe for videoId: $videoId")
         val streamInfo = StreamInfo.getInfo(
             NewPipe.getService(0),
             "https://www.youtube.com/watch?v=$videoId"
@@ -126,8 +134,120 @@ object NewPipeUtils {
         val bestAudio = streamInfo.audioStreams
             .maxByOrNull { it.averageBitrate }
             ?: throw ParsingException("No audio streams found")
+        Timber.tag(TAG).d("Best audio stream: bitrate=${bestAudio.averageBitrate}")
         bestAudio.content.takeIf { it.isNotBlank() }
             ?: throw ParsingException("Audio stream URL is empty")
     }
 
+    /**
+     * Extract player response with decoded URLs using NewPipe.
+     * Similar to SimpMusic's newPipePlayer function.
+     * 
+     * @param videoId The video ID to extract
+     * @param tempRes The original player response to copy metadata from
+     * @return PlayerResponse with decoded stream URLs, or null if extraction fails
+     */
+    fun newPipePlayer(videoId: String, tempRes: PlayerResponse): PlayerResponse? {
+        Timber.tag(TAG).d("Attempting NewPipe player extraction for videoId: $videoId")
+        Timber.tag(TAG).d("Original playabilityStatus: ${tempRes.playabilityStatus.status}")
+        
+        // Even if status is not OK, try extraction - NewPipe might handle it
+        val sigResponse = tempRes
+        
+        val streamsList = try {
+            val streamInfo = StreamInfo.getInfo(
+                NewPipe.getService(0),
+                "https://www.youtube.com/watch?v=$videoId"
+            )
+            val allStreams = streamInfo.audioStreams + streamInfo.videoStreams + streamInfo.videoOnlyStreams
+            val mapped = allStreams.mapNotNull { stream ->
+                val itag = stream.itagItem?.id ?: return@mapNotNull null
+                val url = stream.content
+                if (url.isNotBlank()) Pair(itag, url) else null
+            }
+            
+            // Also add HLS/DASH manifest if available
+            val result = mapped.toMutableList()
+            streamInfo.dashMpdUrl?.takeIf { it.isNotBlank() }?.let {
+                result.add(Pair(96, it))
+            }
+            streamInfo.hlsUrl?.takeIf { it.isNotBlank() }?.let {
+                result.add(Pair(96, it))
+            }
+            result
+        } catch (e: AgeRestrictedContentException) {
+            Timber.tag(TAG).w("Age-restricted content: $videoId")
+            return null
+        } catch (e: ContentNotAvailableException) {
+            Timber.tag(TAG).w("Content not available: $videoId - ${e.message}")
+            return null
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "NewPipe extraction failed for $videoId")
+            return null
+        }
+
+        if (streamsList.isEmpty()) {
+            Timber.tag(TAG).d("NewPipe returned no streams")
+            return null
+        }
+
+        Timber.tag(TAG).d("NewPipe found ${streamsList.size} streams")
+
+        // Copy the response with new URLs
+        val decodedSigResponse = sigResponse.copy(
+            streamingData = sigResponse.streamingData?.copy(
+                formats = sigResponse.streamingData.formats?.map { format ->
+                    format.copy(
+                        url = streamsList.find { it.first == format.itag }?.second ?: format.url
+                    )
+                },
+                adaptiveFormats = sigResponse.streamingData.adaptiveFormats?.map { adaptiveFormat ->
+                    adaptiveFormat.copy(
+                        url = streamsList.find { it.first == adaptiveFormat.itag }?.second ?: adaptiveFormat.url
+                    )
+                },
+                hlsManifestUrl = streamsList.firstOrNull { it.first == 96 }?.second
+                    ?: sigResponse.streamingData.hlsManifestUrl
+            )
+        )
+
+        // Verify we got valid URLs
+        val allUrls = mutableListOf<String>()
+        decodedSigResponse.streamingData?.adaptiveFormats?.mapNotNull { it.url }?.let { allUrls.addAll(it) }
+        decodedSigResponse.streamingData?.formats?.mapNotNull { it.url }?.let { allUrls.addAll(it) }
+
+        if (allUrls.isEmpty()) {
+            Timber.tag(TAG).d("No valid URLs after NewPipe extraction")
+            return null
+        }
+
+        // Validate a random URL
+        val randomUrl = allUrls.randomOrNull() ?: return null
+        if (!validateUrl(randomUrl)) {
+            Timber.tag(TAG).d("URL validation failed")
+            return null
+        }
+
+        Timber.tag(TAG).d("NewPipe extraction successful")
+        return decodedSigResponse
+    }
+
+    /**
+     * Validate URL by checking if it returns 403
+     */
+    fun validateUrl(url: String): Boolean {
+        return try {
+            val request = okhttp3.Request.Builder()
+                .head()
+                .url(url)
+                .build()
+            val response = httpClient.newCall(request).execute()
+            val isValid = response.code != 403
+            Timber.tag(TAG).d("URL validation: ${if (isValid) "OK" else "403"}")
+            isValid
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "URL validation failed")
+            false
+        }
+    }
 }
