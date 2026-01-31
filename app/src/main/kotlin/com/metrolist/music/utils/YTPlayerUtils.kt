@@ -40,10 +40,10 @@ object YTPlayerUtils {
     private val MAIN_CLIENT = ANDROID_VR_NO_AUTH
 
     /**
-     * Main client for uploaded songs - TVHTML5 supports authentication required for uploaded content.
-     * Uploaded songs require TV client with login to play properly.
+     * Main client for uploaded songs - ANDROID_MUSIC is specifically designed for YouTube Music
+     * and is required for playing uploaded songs from the user's library.
      */
-    private val UPLOADED_SONGS_CLIENT = TVHTML5
+    private val UPLOADED_SONGS_CLIENT = YouTubeClient.ANDROID_MUSIC
 
     /**
      * Fallback clients ordered by reliability.
@@ -64,16 +64,16 @@ object YTPlayerUtils {
     )
 
     /**
-     * Fallback clients for uploaded songs - prioritize TV clients that support authentication.
+     * Fallback clients for uploaded songs - prioritize music clients that support authentication.
      * Uploaded songs are private and require login to access.
      */
     private val UPLOADED_SONGS_FALLBACK_CLIENTS = arrayOf(
+        YouTubeClient.ANDROID_MUSIC,
         TVHTML5,
-        TVHTML5_SIMPLY_EMBEDDED_PLAYER,
         WEB_REMIX,
+        TVHTML5_SIMPLY_EMBEDDED_PLAYER,
         WEB_CREATOR,
-        ANDROID_CREATOR,
-        MOBILE
+        ANDROID_CREATOR
     )
 
     data class PlaybackData(
@@ -90,9 +90,9 @@ object YTPlayerUtils {
      * Metadata like audioConfig and videoDetails are from the main client.
      * Format & stream can be from main client or fallback clients.
      * 
-     * @param isUploaded If true, uses TVHTML5 client with authentication for uploaded songs
+     * @param isUploaded If true, uses ANDROID_MUSIC client with authentication for uploaded songs
      *                   which require login to play. Uploaded songs are private content
-     *                   that can only be accessed with TV client authentication.
+     *                   that can only be accessed with YouTube Music client authentication.
      */
     suspend fun playerResponseForPlayback(
         videoId: String,
@@ -103,7 +103,7 @@ object YTPlayerUtils {
     ): Result<PlaybackData> = runCatching {
         val isLoggedIn = YouTube.cookie != null
         
-        // For uploaded songs, we need to use TVHTML5 with authentication
+        // For uploaded songs, we need to use ANDROID_MUSIC with authentication
         val mainClient = if (isUploaded && isLoggedIn) UPLOADED_SONGS_CLIENT else MAIN_CLIENT
         val fallbackClients = if (isUploaded && isLoggedIn) UPLOADED_SONGS_FALLBACK_CLIENTS else FALLBACK_CLIENTS
         

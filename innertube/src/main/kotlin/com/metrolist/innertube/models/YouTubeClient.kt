@@ -75,9 +75,28 @@ data class YouTubeClient(
 
         val TVHTML5 = YouTubeClient(
             clientName = "TVHTML5",
-            clientVersion = "7.20260124.00.00",
+            clientVersion = "7.20250120.10.00",
             clientId = "7",
             userAgent = "Mozilla/5.0(SMART-TV; Linux; Tizen 4.0.0.2) AppleWebkit/605.1.15 (KHTML, like Gecko) SamsungBrowser/9.2 TV Safari/605.1.15",
+            loginSupported = true,
+            loginRequired = true,
+            useSignatureTimestamp = true
+        )
+
+        /**
+         * YouTube Music Android client - specifically designed for music playback.
+         * This client is required for playing uploaded songs from YouTube Music library.
+         */
+        val ANDROID_MUSIC = YouTubeClient(
+            clientName = "ANDROID_MUSIC",
+            clientVersion = "7.27.52",
+            clientId = "21",
+            userAgent = "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 14; en_US; Pixel 8 Pro) gzip",
+            osName = "Android",
+            osVersion = "14",
+            deviceMake = "Google",
+            deviceModel = "Pixel 8 Pro",
+            androidSdkVersion = "34",
             loginSupported = true,
             loginRequired = true,
             useSignatureTimestamp = true
